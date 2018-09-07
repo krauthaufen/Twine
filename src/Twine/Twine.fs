@@ -18,7 +18,7 @@ type TwineStatus =
     | Failed = 5
 
 type Twine<'a>(action : unit -> 'a) =
-    
+    let mutable action = action
     let mutable status = TwineStatus.Created
     let mutable result = Unchecked.defaultof<'a>
     let mutable error = Unchecked.defaultof<exn>
@@ -75,9 +75,11 @@ type Twine<'a>(action : unit -> 'a) =
 
         member x.RunInternal() =
             x.UpdateStatus (fun () -> TwineStatus.Running)
+            let a = action
+            action <- Unchecked.defaultof<_>
 
             try
-                let res = action()
+                let res = a()
                 x.UpdateStatusAndGetCont(fun () -> 
                     result <- res
                     TwineStatus.Finished
@@ -113,7 +115,18 @@ type Twine<'a>(action : unit -> 'a) =
     member x.ContinueWith(action : Twine<'a> -> 'b) =
         let t = Twine<'b>(fun () -> action x)
         if status >= TwineStatus.Finished then
-            pool.Post t
+            let worker = TwineWorker.TwineWorker
+            if not (isNull worker) then
+                let rec run (t : ITwine) =
+                    t.Enqueued pool
+                    match t.RunInternal() with
+                        | [] -> ()
+                        | h :: rest ->
+                            rest |> List.iter pool.Post
+                            run h
+                run t
+            else
+                pool.Post t
         else
             lock x (fun () ->
                 if status >= TwineStatus.Finished then
@@ -123,7 +136,6 @@ type Twine<'a>(action : unit -> 'a) =
                     continuations <- a :: continuations
             )
         t
-            
 
 type MVar<'a>() =
     
@@ -167,15 +179,19 @@ type MVar<'a>() =
                 v
         )
 
-
-
+[<AllowNullLiteral>]
 type internal TwineWorker(parent : TwineThreadPool, index : int) as this =
+    
+    [<ThreadStatic; DefaultValue>]
+    static val mutable private WorkerValue : TwineWorker
+    
     let job = MVar<ITwine>()
     let name = sprintf "TwineWorker%d" index
     let cancel = new CancellationTokenSource()
 
     let thread =
         startThread name (fun () ->
+            TwineWorker.WorkerValue <- this
             try
                 while not cancel.IsCancellationRequested do
                     let t = job.Take(cancel.Token)
@@ -185,8 +201,11 @@ type internal TwineWorker(parent : TwineThreadPool, index : int) as this =
                         | h :: rest ->
                             job.Put h
                             rest |> List.iter parent.Post
-            with :? OperationCanceledException -> ()
+            with :? OperationCanceledException -> 
+                ()
         )
+
+    static member TwineWorker : TwineWorker = TwineWorker.WorkerValue
 
     member x.Post(t : ITwine) =
         job.Put t
@@ -195,8 +214,8 @@ type internal TwineWorker(parent : TwineThreadPool, index : int) as this =
         cancel.Cancel()
         thread.Join()
 
-
 type TwineThreadPool (initial : int) as this =
+    static let def = new TwineThreadPool(Environment.ProcessorCount)
     let mutable canceled = false
 
     let mutable workerIndex = -1
@@ -209,7 +228,6 @@ type TwineThreadPool (initial : int) as this =
         allWorkers.Add worker |> ignore
         worker
         
-
     let spawnWorker () =
         let worker = createWorker()
         workers.Add worker
@@ -228,8 +246,6 @@ type TwineThreadPool (initial : int) as this =
                         worker.Post t
         )
 
-
-
     member internal x.AddIdleWorker(w : TwineWorker) =
         workers.Add w
         
@@ -238,6 +254,8 @@ type TwineThreadPool (initial : int) as this =
         match workers.TryTake() with
             | (true, w) -> w.Post t
             | _ -> pending.Add t
+
+    static member Default = def
 
     member x.Post<'a>(t : Twine<'a>) : unit =
         if t.Status > TwineStatus.Created then failwith "[Twine] cannot post a started twine"
@@ -255,8 +273,97 @@ type TwineThreadPool (initial : int) as this =
         pending.Dispose()
         
     member x.Start(action : unit -> 'a) =
+        let worker = TwineWorker.TwineWorker
         let twine = Twine<'a>(action)
-        x.Post twine
+
+        if isNull worker then
+            x.Post twine
+            twine
+        else       
+            let rec run (t : ITwine) =
+                t.Enqueued x
+                match t.RunInternal() with
+                    | [] -> ()
+                    | h :: rest ->
+                        rest |> List.iter x.Post
+                        run h
+            run twine
+            twine
+
+    member x.FromWaitHandle(handle : WaitHandle) =
+        let mutable reg = Unchecked.defaultof<RegisteredWaitHandle>
+        let twine = Twine<unit>(Unchecked.defaultof<_>)
+        let cont (o : obj) (b : bool) =
+            twine.SetResult(x, ())
+            reg.Unregister(handle) |> ignore
+            
+        reg <- ThreadPool.RegisterWaitForSingleObject(handle, WaitOrTimerCallback(cont), null, -1, true)
+        twine
+
+    member x.FromWaitHandle(handle : WaitHandle, ct : CancellationToken) =
+        let mutable cancelReg = { new IDisposable with member x.Dispose() = () }
+        let mutable waitReg = Unchecked.defaultof<RegisteredWaitHandle>
+
+        let mutable cnt = 0
+
+
+        let cleanup() =
+            waitReg.Unregister handle |> ignore
+            cancelReg.Dispose()
+            waitReg <- Unchecked.defaultof<_>
+            cancelReg <- Unchecked.defaultof<_>
+
+        let twine = Twine<unit>(Unchecked.defaultof<_>)
+        let cont (o : obj) (isTimeout : bool) =
+            if Interlocked.Exchange(&cnt, 1) = 0 then
+                twine.SetResult(x, ())
+                cleanup()
+            
+        waitReg <- 
+            ThreadPool.RegisterWaitForSingleObject(handle, WaitOrTimerCallback(cont), null, -1, true)
+
+        cancelReg <- 
+            ct.Register(fun () ->
+                if Interlocked.Exchange(&cnt, 1) = 0 then
+                    twine.SetCanceled(x)
+                    cleanup()
+            )
+
+        twine
+        
+    member x.FromWaitHandle(handle : WaitHandle, timeout : int, ct : CancellationToken) =
+        let mutable cancelReg = { new IDisposable with member x.Dispose() = () }
+        let mutable waitReg = Unchecked.defaultof<RegisteredWaitHandle>
+
+        let mutable cnt = 0
+
+
+        let cleanup() =
+            waitReg.Unregister handle |> ignore
+            cancelReg.Dispose()
+            waitReg <- Unchecked.defaultof<_>
+            cancelReg <- Unchecked.defaultof<_>
+
+        let twine = Twine<bool>(Unchecked.defaultof<_>)
+        let cont (o : obj) (isTimeout : bool) =
+            
+            if Interlocked.Exchange(&cnt, 1) = 0 then
+                if isTimeout then
+                    twine.SetResult(x, false)
+                else
+                    twine.SetResult(x, true)
+                    cleanup()
+            
+        waitReg <- 
+            ThreadPool.RegisterWaitForSingleObject(handle, WaitOrTimerCallback(cont), null, timeout, true)
+
+        cancelReg <- 
+            ct.Register(fun () ->
+                if Interlocked.Exchange(&cnt, 1) = 0 then
+                    twine.SetCanceled(x)
+                    cleanup()
+            )
+
         twine
 
     member x.FromBeginEnd(beginFun : (IAsyncResult * obj -> unit) * obj -> IAsyncResult, endFun : IAsyncResult -> 'a) =
@@ -289,6 +396,15 @@ type TwineThreadPool (initial : int) as this =
     interface IDisposable with
         member x.Dispose() = x.Dispose()
 
+[<AbstractClass>]
+type Twine =
+    
+    static member inline FromResult(value : 'a) = TwineThreadPool.Default.FromResult value
+    static member inline Run(action : unit -> 'a) = TwineThreadPool.Default.Start action
+    static member inline FromBeginEnd(b,e) = TwineThreadPool.Default.FromBeginEnd(b,e)
+    static member inline FromWaitHandle(w) = TwineThreadPool.Default.FromWaitHandle(w)
+    static member inline FromWaitHandle(w,ct) = TwineThreadPool.Default.FromWaitHandle(w, ct)
+    static member inline FromWaitHandle(w,ct,timeout) = TwineThreadPool.Default.FromWaitHandle(w, ct, timeout)
 
 
 

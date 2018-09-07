@@ -1,33 +1,54 @@
 open System
 open Twine
 open System.Threading
+open System.IO
+open System.Diagnostics
 
 [<EntryPoint;STAThread>]
 let main argv = 
+    
 
-    use pool = new TwineThreadPool(4)
+    let sem = new SemaphoreSlim(0)
 
-    let twine = TwinyBuilder()
-
-    let a = 
-        pool.Start(fun () ->
-            Thread.Sleep(100)
-            10
-        )
-
-
+    let sw = Stopwatch()
     let test =
-        twine {
-            let! a = a
-            return 10 * a
+        cont {
+            printfn "waiting: %d" Thread.CurrentThread.ManagedThreadId
+            let! r = Cont.AwaitWaitHandle sem.AvailableWaitHandle
+            sw.Stop()
+            printfn "done: %d" Thread.CurrentThread.ManagedThreadId
+            printfn "took: %.3fs" sw.Elapsed.TotalSeconds
+            ()
         }
 
-    let b = pool.Start test
-        //a.ContinueWith(fun tw ->
-        //    let a = tw.Result
-        //    2 * a
-        //)
+    let t = Cont.StartAsTwine test
+    
+    Thread.Sleep 100
+    printfn "signal: %d" Thread.CurrentThread.ManagedThreadId
+    sw.Start()
+    sem.Release() |> ignore
 
-    printfn "%A" b.Result
+    t.Wait()
+
+    for i in 1 .. 100 do
+        let sem = new Semaphore(0, 1)
+
+        let sw = Stopwatch()
+        let test =
+            cont {
+                //sem.WaitOne() |> ignore
+                let! r = Cont.AwaitWaitHandle sem
+                sw.Stop()
+                printfn "took: %.3fus" (1000.0 * sw.Elapsed.TotalMilliseconds)
+                ()
+            }
+
+        let t = Cont.StartAsTwine test
+    
+        sw.Start()
+        sem.Release() |> ignore
+
+        t.Wait()
+
   
     0
